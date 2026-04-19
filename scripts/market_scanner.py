@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
+"""
+market_scanner.py — Core options scanning and Greeks calculation engine.
+
+Fetches option chains via yfinance, validates IV/bid-ask spreads, calls
+the C++ fast_greeks engine for batch Black-Scholes calculations, and
+filters results by probability of profit and delta range.
+"""
 
 import time
 import random
 import sys
 import math
+import logging
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -12,12 +20,21 @@ import pandas as pd
 import yfinance as yf
 from requests_cache import CachedSession
 
+logger = logging.getLogger(__name__)
+
 try:
     import fast_greeks
 except ImportError:
     print("ERROR: fast_greeks module not found!")
     print("Please install it first by running: pip install -e .")
     sys.exit(1)
+
+# Delta range for a classic 16–30 delta put-selling setup
+DELTA_MIN = -0.35
+DELTA_MAX = -0.10
+
+# Minimum bid-ask mid price to filter illiquid options
+MIN_MID_PRICE = 0.05
 
 
 def get_sp500_tickers() -> List[str]:
@@ -93,6 +110,51 @@ class SmartFetcher:
 
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def get_iv_rank(ticker: str, current_iv: float, lookback_days: int = 252) -> Optional[float]:
+    """
+    Calculate IV Rank for a ticker over the past `lookback_days` trading days.
+
+    IV Rank = (current_iv - 52w_low) / (52w_high - 52w_low) * 100
+
+    Returns a value 0–100, or None if historical data is unavailable.
+    High IV Rank (>50) suggests elevated premiums — favourable for selling puts.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1y")
+
+        if hist.empty or len(hist) < 20:
+            return None
+
+        hist = hist.tail(lookback_days)
+        returns = hist["Close"].pct_change().dropna()
+
+        if len(returns) < 20:
+            return None
+
+        # Rolling 21-day realised vol as IV proxy (annualised)
+        window = min(21, len(returns))
+        rolling_vol = returns.rolling(window).std() * math.sqrt(252) * 100
+        rolling_vol = rolling_vol.dropna()
+
+        if rolling_vol.empty:
+            return None
+
+        iv_52w_low = float(rolling_vol.min())
+        iv_52w_high = float(rolling_vol.max())
+
+        if iv_52w_high == iv_52w_low:
+            return 50.0
+
+        iv_pct = current_iv * 100.0
+        iv_rank = (iv_pct - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100.0
+        return round(max(0.0, min(100.0, iv_rank)), 1)
+
+    except Exception as e:
+        logger.warning(f"IV Rank calculation failed for {ticker}: {e}")
+        return None
 
 
 def calculate_probability_of_profit(
@@ -286,27 +348,27 @@ def get_data(ticker: str, risk_free_rate: float = 0.045, min_pop: float = 0.80) 
         for i in range(len(strikes)):
             strike = strikes[i]
             iv_raw = ivs_raw[i] if i < len(ivs_raw) else 0
-            
+
             if iv_raw <= 0 or mid_prices[i] <= 0:
                 continue
-            
+
             if strike < strike_min or strike > strike_max:
                 continue
-            
+
             if strike < 0.50:
                 continue
-            
+
             iv_normalized = iv_raw
-            
+
             if iv_normalized > 4.0:
                 iv_normalized = iv_normalized / 100.0
-            
+
             if iv_normalized > 5.0:
                 iv_normalized = 5.0
-            
+
             if iv_normalized < 0.001 or iv_normalized > 2.0:
                 continue
-            
+
             valid_indices.append(i)
             spot_prices_list.append(current_price)
             strikes_list.append(strike)
@@ -342,11 +404,11 @@ def get_data(ticker: str, risk_free_rate: float = 0.045, min_pop: float = 0.80) 
             
             if abs(delta) < 0.01:
                 continue
-            
-            if not (-0.35 <= delta <= -0.10):
+
+            if not (DELTA_MIN <= delta <= DELTA_MAX):
                 continue
-            
-            if mid_price < 0.05:
+
+            if mid_price < MIN_MID_PRICE:
                 continue
             
             pop = calculate_probability_of_profit(
