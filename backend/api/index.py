@@ -14,7 +14,7 @@ import scripts.market_scanner as scanner
 app = FastAPI(
     title="Theta-Prime API",
     description="Options scanner for put-selling opportunities with VIX-based risk filtering.",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -76,7 +76,49 @@ def get_vix_market_status():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "1.2.0"}
+    return {"status": "ok", "version": "1.3.0"}
+
+
+@app.get("/api/movers")
+async def get_top_movers(
+    watchlist: str = Query(
+        default="AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,JPM,V,UNH",
+        description="Comma-separated list of tickers",
+    ),
+    limit: int = Query(default=5, ge=1, le=20, description="Number of movers to return"),
+):
+    """Return the top gaining and losing tickers from a watchlist for today."""
+    tickers = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
+    if not tickers:
+        raise HTTPException(status_code=400, detail="No tickers provided")
+
+    results = []
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="2d")
+            if len(hist) >= 2:
+                prev_close = float(hist["Close"].iloc[-2])
+                last_close = float(hist["Close"].iloc[-1])
+                change_pct = ((last_close - prev_close) / prev_close) * 100
+                results.append({
+                    "ticker": ticker,
+                    "price": round(last_close, 2),
+                    "prev_close": round(prev_close, 2),
+                    "change_pct": round(change_pct, 2),
+                })
+        except Exception:
+            pass
+
+    results.sort(key=lambda r: r["change_pct"], reverse=True)
+    gainers = results[:limit]
+    losers = list(reversed(results))[:limit]
+
+    return {
+        "gainers": gainers,
+        "losers": losers,
+        "scanned": len(results),
+    }
 
 
 @app.get("/api/vix")
